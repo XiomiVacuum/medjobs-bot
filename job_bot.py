@@ -248,6 +248,18 @@ def fetch_mdi_jobs():
         resp = requests.get(MDI_JOBS_URL, timeout=REQUEST_TIMEOUT,
                              headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
+
+        # Some caching/bot-protection layers return a tiny placeholder on the
+        # first hit (e.g. HTTP 202) instead of the real page. Retry once
+        # after a short pause before giving up.
+        if resp.status_code == 202 or len(resp.text) < 2000:
+            print(f"MDI: first attempt looked like a placeholder "
+                  f"(HTTP {resp.status_code}, {len(resp.text)} chars) - retrying")
+            time.sleep(3)
+            resp = requests.get(MDI_JOBS_URL, timeout=REQUEST_TIMEOUT,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+
         soup = BeautifulSoup(resp.text, "html.parser")
 
         headings = [h for h in soup.find_all(["h2", "h3"])
