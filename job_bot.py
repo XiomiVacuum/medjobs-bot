@@ -259,4 +259,195 @@ def fetch_mdi_jobs():
             a = h.find("a", href=lambda x: x and "/job/" in x)
             title = a.get_text(strip=True)
             link = a["href"].strip()
-            if not
+            if not title or not link:
+                continue
+
+            company = category = location = date_text = ""
+            is_new = False
+
+            steps = 0
+            for elem in h.find_all_next():
+                if elem.name in ("h2", "h3", "hr"):
+                    break
+                if elem.name == "ul":
+                    lis = [li.get_text(strip=True) for li in elem.find_all("li")]
+                    joined = " ".join(lis).lower()
+                    if "new job" in joined:
+                        is_new = True
+                    elif lis and not company:
+                        company = lis[0] if len(lis) > 0 else ""
+                        category = lis[1] if len(lis) > 1 else ""
+                        location = lis[2] if len(lis) > 2 else ""
+                        date_text = lis[3] if len(lis) > 3 else ""
+                steps += 1
+                if steps > 60:
+                    break
+
+            if not is_new:
+                continue  # only take listings MDI itself flags as recent
+
+            snippet_parts = [p for p in [category, location, date_text] if p]
+            results.append({
+                "title": title,
+                "company": company or "MDI listing",
+                "location": location or "Israel",
+                "snippet": " | ".join(snippet_parts),
+                "link": link,
+                "updated": datetime.now(timezone.utc).isoformat(),
+                "source": "MDI",
+            })
+
+        print(f"MDI: {len(results)} new-flagged listings found on page 1")
+    except requests.RequestException as e:
+        print(f"ERROR fetching MDI jobs page: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR parsing MDI jobs page: {e}", file=sys.stderr)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
+def parse_updated(value):
+    """Best-effort parse of a job's 'updated' timestamp into an aware datetime."""
+    if not value:
+        return None
+    formats = [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ]
+    v = value.replace("Z", "+00:00") if isinstance(value, str) else value
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(v, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            continue
+    try:
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def is_recent(job):
+    dt = parse_updated(job.get("updated"))
+    if dt is None:
+        # Unknown date: don't discard outright, dedup will still protect us.
+        return True
+    age = datetime.now(timezone.utc) - dt
+    return age <= timedelta(hours=MAX_AGE_HOURS)
+
+
+def matches_medical_device(job):
+    if job.get("source") == "MDI":
+        return True  # every MDI listing is already medical device / Israel by definition
+    haystack = f"{job.get('title', '')} {job.get('snippet', '')}".lower()
+    return any(kw in haystack for kw in MEDICAL_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Telegram posting
+# ---------------------------------------------------------------------------
+
+def send_to_telegram(job):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("ERROR: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.", file=sys.stderr)
+        return False
+
+    title = escape_html(job["title"] or "New position")
+    company = escape_html(job["company"] or "Unknown company")
+    location = escape_html(job["location"] or "Location not specified")
+    snippet = escape_html(job["snippet"])
+    if len(snippet) > 220:
+        snippet = snippet[:220].rsplit(" ", 1)[0] + "..."
+    link = job["link"]
+
+    text = f"<b>{title}</b>\n{company} | {location}\n"
+    if snippet:
+        text += f"{snippet}\n"
+    text += f"\n🔗 <a href=\"{link}\">Apply here</a>"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            print(f"ERROR sending to Telegram: {resp.status_code} {resp.text}", file=sys.stderr)
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"ERROR sending to Telegram: {e}", file=sys.stderr)
+        return False
+
+
+def escape_html(text):
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    now_il = datetime.now(ISRAEL_TZ)
+    print(f"Job bot started. Current Israel time: {now_il.strftime('%A %Y-%m-%d %H:%M')}")
+    sys.stdout.flush()
+
+    if in_weekend_blackout():
+        print("Weekend blackout window (Fri 13:00 - Sat 21:00 Israel time) - skipping this run.")
+        sys.stdout.flush()
+        return
+
+    raw_state, original_raw = load_state()
+    state = prune_state(raw_state)
+
+    all_jobs = []
+    all_jobs.extend(fetch_jooble_jobs())
+    all_jobs.extend(fetch_greenhouse_jobs())
+    all_jobs.extend(fetch_lever_jobs())
+    all_jobs.extend(fetch_mdi_jobs())
+
+    print(f"Fetched {len(all_jobs)} total jobs across all sources.")
+
+    new_count = 0
+    sent_count = 0
+
+    for job in all_jobs:
+        if not job.get("link") or not job.get("title"):
+            continue
+        if not matches_medical_device(job):
+            continue
+        if not is_recent(job):
+            continue
+
+        h = job_hash(job["link"], job["title"], job["company"])
+        if h in state:
+            continue
+
+        new_count += 1
+        if send_to_telegram(job):
+            sent_count += 1
+            state[h] = datetime.now(timezone.utc).isoformat()
+            time.sleep(1.5)  # gentle rate limiting on Telegram sends
+
+    save_state(state, original_raw)
+    print(f"New matching jobs found: {new_count}. Successfully posted: {sent_count}.")
+
+
+if __name__ == "__main__":
+    main()
