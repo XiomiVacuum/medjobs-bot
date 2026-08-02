@@ -251,7 +251,7 @@ def fetch_workday_jobs():
         url = f"https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
         base_url = f"https://{tenant}.{host}.myworkdayjobs.com/{site}"
         try:
-            payload = {"appliedFacets": {}, "limit": 100, "offset": 0,
+            payload = {"appliedFacets": {}, "limit": 50, "offset": 0,
                        "searchText": "medical device"}
             resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
