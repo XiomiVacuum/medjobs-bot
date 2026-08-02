@@ -57,6 +57,15 @@ LEVER_BOARDS = [
     # "example-medtech-co",
 ]
 
+# Workday-based company career sites. Each entry needs the tenant, host
+# (e.g. wd1, wd5 - varies per company), and site name, found from the
+# company's careers URL: https://{tenant}.{host}.myworkdayjobs.com/{site}
+WORKDAY_BOARDS = [
+    {"tenant": "medtronic", "host": "wd1", "site": "MedtronicCareers", "name": "Medtronic"},
+    {"tenant": "gehc", "host": "wd5", "site": "GEHC_ExternalSite", "name": "GE HealthCare"},
+    {"tenant": "jj", "host": "wd5", "site": "JJ", "name": "Johnson & Johnson"},
+]
+
 STATE_FILE = os.path.join(os.path.dirname(__file__), "posted_jobs.json")
 STATE_RETENTION_DAYS = 14  # prune dedup records older than this
 
@@ -231,6 +240,55 @@ def strip_html(text):
 
 
 # ---------------------------------------------------------------------------
+# Source: Workday (generic, used by many large companies incl. Medtronic,
+# GE HealthCare, J&J)
+# ---------------------------------------------------------------------------
+
+def fetch_workday_jobs():
+    results = []
+    for board in WORKDAY_BOARDS:
+        tenant, host, site, name = board["tenant"], board["host"], board["site"], board["name"]
+        url = f"https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+        base_url = f"https://{tenant}.{host}.myworkdayjobs.com/{site}"
+        try:
+            payload = {"appliedFacets": {}, "limit": 20, "offset": 0,
+                       "searchText": "medical device"}
+            resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            postings = data.get("jobPostings", [])
+            print(f"Workday ({name}): {len(postings)} results")
+
+            for j in postings:
+                posted_on = (j.get("postedOn") or "").lower()
+                # Workday gives relative text ("Posted Today", "Posted 2 Days
+                # Ago") instead of a real timestamp. Approximate recency from
+                # it; dedup covers anything imprecise here.
+                if "today" in posted_on or "yesterday" in posted_on:
+                    updated_iso = datetime.now(timezone.utc).isoformat()
+                else:
+                    updated_iso = ""  # unknown -> treated as recent by is_recent(), dedup protects us
+
+                external_path = j.get("externalPath", "")
+                link = base_url + external_path if external_path else ""
+
+                results.append({
+                    "title": j.get("title", "").strip(),
+                    "company": name,
+                    "location": j.get("locationsText", "").strip(),
+                    "snippet": posted_on.capitalize(),
+                    "link": link,
+                    "updated": updated_iso,
+                    "source": "Workday",
+                })
+        except requests.RequestException as e:
+            print(f"ERROR fetching Workday board '{name}': {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR parsing Workday board '{name}': {e}", file=sys.stderr)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Source: MDI (Israeli medical device community job board)
 # ---------------------------------------------------------------------------
 
@@ -361,8 +419,8 @@ def is_recent(job):
 
 
 def matches_medical_device(job):
-    if job.get("source") == "MDI":
-        return True  # every MDI listing is already medical device / Israel by definition
+    if job.get("source") in ("MDI", "Workday"):
+        return True  # sourced from dedicated medical device boards/companies already
     haystack = f"{job.get('title', '')} {job.get('snippet', '')}".lower()
     return any(kw in haystack for kw in MEDICAL_KEYWORDS)
 
@@ -432,6 +490,7 @@ def main():
     all_jobs.extend(fetch_jooble_jobs())
     all_jobs.extend(fetch_greenhouse_jobs())
     all_jobs.extend(fetch_lever_jobs())
+    all_jobs.extend(fetch_workday_jobs())
     all_jobs.extend(fetch_mdi_jobs())
 
     print(f"Fetched {len(all_jobs)} total jobs across all sources.")
