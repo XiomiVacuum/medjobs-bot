@@ -251,7 +251,7 @@ def fetch_workday_jobs():
         url = f"https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
         base_url = f"https://{tenant}.{host}.myworkdayjobs.com/{site}"
         try:
-            payload = {"appliedFacets": {}, "limit": 20, "offset": 0,
+            payload = {"appliedFacets": {}, "limit": 100, "offset": 0,
                        "searchText": "medical device"}
             resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
@@ -260,6 +260,10 @@ def fetch_workday_jobs():
             print(f"Workday ({name}): {len(postings)} results")
 
             for j in postings:
+                location_text = j.get("locationsText", "").strip()
+                if "israel" not in location_text.lower():
+                    continue  # Workday's search isn't location-scoped, so filter here
+
                 posted_on = (j.get("postedOn") or "").lower()
                 # Workday gives relative text ("Posted Today", "Posted 2 Days
                 # Ago") instead of a real timestamp. Approximate recency from
@@ -275,7 +279,7 @@ def fetch_workday_jobs():
                 results.append({
                     "title": j.get("title", "").strip(),
                     "company": name,
-                    "location": j.get("locationsText", "").strip(),
+                    "location": location_text,
                     "snippet": posted_on.capitalize(),
                     "link": link,
                     "updated": updated_iso,
@@ -454,15 +458,22 @@ def send_to_telegram(job):
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200:
-            print(f"ERROR sending to Telegram: {resp.status_code} {resp.text}", file=sys.stderr)
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+                print(f"Telegram rate limit hit, waiting {retry_after}s before retry")
+                time.sleep(retry_after + 1)
+                continue
+            if resp.status_code != 200:
+                print(f"ERROR sending to Telegram: {resp.status_code} {resp.text}", file=sys.stderr)
+                return False
+            return True
+        except requests.RequestException as e:
+            print(f"ERROR sending to Telegram: {e}", file=sys.stderr)
             return False
-        return True
-    except requests.RequestException as e:
-        print(f"ERROR sending to Telegram: {e}", file=sys.stderr)
-        return False
+    return False
 
 
 def escape_html(text):
@@ -514,7 +525,7 @@ def main():
         if send_to_telegram(job):
             sent_count += 1
             state[h] = datetime.now(timezone.utc).isoformat()
-            time.sleep(1.5)  # gentle rate limiting on Telegram sends
+            time.sleep(2.5)  # gentle rate limiting on Telegram sends
 
     save_state(state, original_raw)
     print(f"New matching jobs found: {new_count}. Successfully posted: {sent_count}.")
