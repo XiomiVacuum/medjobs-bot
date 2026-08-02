@@ -252,40 +252,47 @@ def fetch_workday_jobs():
         url = f"https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
         base_url = f"https://{tenant}.{host}.myworkdayjobs.com/{site}"
         try:
-            payload = {"appliedFacets": {}, "limit": 50, "offset": 0,
-                       "searchText": "medical device"}
-            resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            postings = data.get("jobPostings", [])
-            print(f"Workday ({name}): {len(postings)} results")
+            session = requests.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0"})
+            session.get(base_url, timeout=REQUEST_TIMEOUT)  # establish cookies first
 
-            for j in postings:
-                location_text = j.get("locationsText", "").strip()
-                if "israel" not in location_text.lower():
-                    continue  # Workday's search isn't location-scoped, so filter here
+            for offset in (0, 20, 40):
+                payload = {"appliedFacets": {}, "limit": 20, "offset": offset,
+                           "searchText": "medical device"}
+                resp = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                data = resp.json()
+                postings = data.get("jobPostings", [])
+                print(f"Workday ({name}): {len(postings)} results at offset {offset}")
+                if not postings:
+                    break  # no more pages
 
-                posted_on = (j.get("postedOn") or "").lower()
-                # Workday gives relative text ("Posted Today", "Posted 2 Days
-                # Ago") instead of a real timestamp. Approximate recency from
-                # it; dedup covers anything imprecise here.
-                if "today" in posted_on or "yesterday" in posted_on:
-                    updated_iso = datetime.now(timezone.utc).isoformat()
-                else:
-                    updated_iso = ""  # unknown -> treated as recent by is_recent(), dedup protects us
+                for j in postings:
+                    location_text = j.get("locationsText", "").strip()
+                    if "israel" not in location_text.lower():
+                        continue  # Workday's search isn't location-scoped, so filter here
 
-                external_path = j.get("externalPath", "")
-                link = base_url + external_path if external_path else ""
+                    posted_on = (j.get("postedOn") or "").lower()
+                    # Workday gives relative text ("Posted Today", "Posted 2 Days
+                    # Ago") instead of a real timestamp. Approximate recency from
+                    # it; dedup covers anything imprecise here.
+                    if "today" in posted_on or "yesterday" in posted_on:
+                        updated_iso = datetime.now(timezone.utc).isoformat()
+                    else:
+                        updated_iso = ""  # unknown -> treated as recent by is_recent(), dedup protects us
 
-                results.append({
-                    "title": j.get("title", "").strip(),
-                    "company": name,
-                    "location": location_text,
-                    "snippet": posted_on.capitalize(),
-                    "link": link,
-                    "updated": updated_iso,
-                    "source": "Workday",
-                })
+                    external_path = j.get("externalPath", "")
+                    link = base_url + external_path if external_path else ""
+
+                    results.append({
+                        "title": j.get("title", "").strip(),
+                        "company": name,
+                        "location": location_text,
+                        "snippet": posted_on.capitalize(),
+                        "link": link,
+                        "updated": updated_iso,
+                        "source": "Workday",
+                    })
         except requests.RequestException as e:
             print(f"ERROR fetching Workday board '{name}': {e}", file=sys.stderr)
         except Exception as e:
