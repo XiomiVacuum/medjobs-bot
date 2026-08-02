@@ -70,6 +70,7 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "posted_jobs.json")
 STATE_RETENTION_DAYS = 14  # prune dedup records older than this
 
 MDI_JOBS_URL = "https://medical-device.co.il/jobs/"
+DIALOG_JOBS_URL = "https://www.dialog.co.il/high-tech/industries/medical"
 
 # No new postings during the weekend: Friday 13:00 through Saturday 21:00,
 # Israel local time (handles daylight saving automatically).
@@ -381,6 +382,92 @@ def fetch_mdi_jobs():
 
 
 # ---------------------------------------------------------------------------
+# Source: Dialog (Israeli tech recruitment agency, Medical Device category)
+# ---------------------------------------------------------------------------
+
+DIALOG_REGIONS = [
+    "ת\"א והמרכז", "השרון", "חיפה והצפון", "השפלה",
+    "ירושלים", "באר שבע והדרום", "יהודה ושומרון", "אחר", "כל הארץ",
+]
+
+
+def fetch_dialog_jobs():
+    """
+    Parses Dialog's Medical Device jobs listing page (an Israeli tech
+    recruitment agency). Listings here are pre-filtered to the medical
+    device industry, so they bypass the keyword filter. No exact posting
+    timestamp is shown, so we rely on the page's newest-first ordering plus
+    dedup rather than a strict 24h cutoff.
+    """
+    results = []
+    try:
+        resp = requests.get(DIALOG_JOBS_URL, timeout=REQUEST_TIMEOUT,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+
+        if len(resp.text) < 3000:
+            print(f"Dialog: first attempt looked like a placeholder "
+                  f"({len(resp.text)} chars) - retrying")
+            time.sleep(3)
+            resp = requests.get(DIALOG_JOBS_URL, timeout=REQUEST_TIMEOUT,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        headings = [h for h in soup.find_all(["h3"])
+                    if h.find("a", href=lambda x: x and "positionId=" in x)]
+        print(f"Dialog: HTTP {resp.status_code}, page length {len(resp.text)} chars, "
+              f"{len(headings)} job headings found")
+
+        for h in headings:
+            a = h.find("a", href=lambda x: x and "positionId=" in x)
+            title = a.get_text(strip=True)
+            link = a["href"].strip()
+            if link.startswith("/"):
+                link = "https://www.dialog.co.il" + link
+            if not title or not link:
+                continue
+
+            company_desc = ""
+            region = ""
+            steps = 0
+            for elem in h.find_all_next():
+                if elem.name == "h3":
+                    break
+                text = elem.get_text(strip=True)
+                if elem.name in ("p", "div", "span", "li") and not company_desc:
+                    if "תעשיה" in text or "Medical Device" in text:
+                        company_desc = text
+                if not region:
+                    for r in DIALOG_REGIONS:
+                        if text == r:
+                            region = r
+                            break
+                steps += 1
+                if steps > 80:
+                    break
+
+            results.append({
+                "title": title,
+                "company": "Dialog listing",
+                "location": region or "Israel",
+                "snippet": company_desc[:220],
+                "link": link,
+                "updated": "",  # no exact timestamp; rely on ordering + dedup
+                "source": "Dialog",
+            })
+
+        print(f"Dialog: {len(results)} listings parsed from page 1")
+    except requests.RequestException as e:
+        print(f"ERROR fetching Dialog jobs page: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR parsing Dialog jobs page: {e}", file=sys.stderr)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Filtering
 # ---------------------------------------------------------------------------
 
@@ -423,7 +510,7 @@ def is_recent(job):
 
 
 def matches_medical_device(job):
-    if job.get("source") in ("MDI", "Workday"):
+    if job.get("source") in ("MDI", "Workday", "Dialog"):
         return True  # sourced from dedicated medical device boards/companies already
     haystack = f"{job.get('title', '')} {job.get('snippet', '')}".lower()
     return any(kw in haystack for kw in MEDICAL_KEYWORDS)
@@ -503,6 +590,7 @@ def main():
     all_jobs.extend(fetch_lever_jobs())
     all_jobs.extend(fetch_workday_jobs())
     all_jobs.extend(fetch_mdi_jobs())
+    all_jobs.extend(fetch_dialog_jobs())
 
     print(f"Fetched {len(all_jobs)} total jobs across all sources.")
 
