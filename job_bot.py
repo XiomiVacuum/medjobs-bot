@@ -71,6 +71,7 @@ STATE_RETENTION_DAYS = 14  # prune dedup records older than this
 
 MDI_JOBS_URL = "https://medical-device.co.il/jobs/"
 DIALOG_JOBS_URL = "https://www.dialog.co.il/high-tech/industries/medical"
+ALLJOBS_URL = "https://www.alljobs.co.il/SearchResultsGuest.aspx?page=1&position=939&type=&city=&region="
 
 # No new postings during the weekend: Friday 13:00 through Saturday 21:00,
 # Israel local time (handles daylight saving automatically).
@@ -475,6 +476,134 @@ def fetch_dialog_jobs():
 
 
 # ---------------------------------------------------------------------------
+# Source: AllJobs (large general Israeli job board, Medical Device category)
+# ---------------------------------------------------------------------------
+
+def parse_hebrew_relative_time(text):
+    """Parses Hebrew relative time phrases like 'לפני 3 שעות' (3 hours ago)
+    or 'לפני 2 ימים' (2 days ago) into an approximate hours-ago number."""
+    import re
+    m = re.search(r"לפני\s+(\d+)\s*(שעה|שעות|יום|ימים|דקה|דקות|שבוע|שבועות)", text)
+    if not m:
+        if "לפני יום" in text:
+            return 24
+        if "לפני שבוע" in text:
+            return 168
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if "שע" in unit:
+        return n
+    if "יום" in unit or "ימים" in unit:
+        return n * 24
+    if "דק" in unit:
+        return 0
+    if "שבוע" in unit:
+        return n * 168
+    return None
+
+
+def fetch_alljobs_jobs():
+    """
+    Parses AllJobs' Medical Device category listing (a large general
+    Israeli job board). AllJobs shows explicit Hebrew relative posting
+    times ("לפני X שעות"), which we use for real recency filtering, unlike
+    MDI/Dialog which lack exact timestamps.
+    """
+    results = []
+    try:
+        resp = requests.get(ALLJOBS_URL, timeout=REQUEST_TIMEOUT,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+
+        if len(resp.text) < 5000:
+            print(f"AllJobs: first attempt looked like a placeholder "
+                  f"({len(resp.text)} chars) - retrying")
+            time.sleep(3)
+            resp = requests.get(ALLJOBS_URL, timeout=REQUEST_TIMEOUT,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        seen_job_ids = set()
+        headings = []
+        for h in soup.find_all(["h2", "h3"]):
+            a = h.find("a", href=lambda x: x and "JobID=" in x)
+            if a:
+                jid = a["href"].split("JobID=")[-1].split("&")[0]
+                if jid not in seen_job_ids:
+                    seen_job_ids.add(jid)
+                    headings.append((h, a, jid))
+
+        print(f"AllJobs: HTTP {resp.status_code}, page length {len(resp.text)} chars, "
+              f"{len(headings)} job headings found")
+
+        for h, a, jid in headings:
+            title = a.get_text(strip=True)
+            link = a["href"].strip()
+            if link.startswith("/"):
+                link = "https://www.alljobs.co.il" + link
+            if not title:
+                continue
+
+            company = location = snippet = ""
+            hours_ago = None
+            steps = 0
+            for elem in h.find_all_previous():
+                text = elem.get_text(strip=True)
+                if hours_ago is None and "לפני" in text and len(text) < 30:
+                    parsed = parse_hebrew_relative_time(text)
+                    if parsed is not None:
+                        hours_ago = parsed
+                        break
+                steps += 1
+                if steps > 15:
+                    break
+
+            steps = 0
+            for elem in h.find_all_next():
+                if elem.name in ("h2", "h3"):
+                    break
+                text = elem.get_text(strip=True)
+                if not location and "מיקום המשרה" in text:
+                    loc_links = elem.find_all("a")
+                    if loc_links:
+                        location = loc_links[0].get_text(strip=True)
+                if not company and elem.name == "a" and elem.get("href", "").startswith(
+                        "https://www.alljobs.co.il/Employer/HP/"):
+                    company = elem.get_text(strip=True)
+                if not snippet and elem.name == "p" and len(text) > 20:
+                    snippet = text
+                steps += 1
+                if steps > 40:
+                    break
+
+            if hours_ago is None:
+                continue  # can't confirm recency, skip rather than risk stale spam
+            if hours_ago > MAX_AGE_HOURS:
+                continue
+
+            results.append({
+                "title": title,
+                "company": company or "AllJobs listing",
+                "location": location or "Israel",
+                "snippet": snippet[:220],
+                "link": link,
+                "updated": (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat(),
+                "source": "AllJobs",
+            })
+
+        print(f"AllJobs: {len(results)} recent listings parsed from page 1")
+    except requests.RequestException as e:
+        print(f"ERROR fetching AllJobs page: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR parsing AllJobs page: {e}", file=sys.stderr)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Filtering
 # ---------------------------------------------------------------------------
 
@@ -517,7 +646,7 @@ def is_recent(job):
 
 
 def matches_medical_device(job):
-    if job.get("source") in ("MDI", "Workday", "Dialog"):
+    if job.get("source") in ("MDI", "Workday", "Dialog", "AllJobs"):
         return True  # sourced from dedicated medical device boards/companies already
     haystack = f"{job.get('title', '')} {job.get('snippet', '')}".lower()
     return any(kw in haystack for kw in MEDICAL_KEYWORDS)
@@ -598,6 +727,7 @@ def main():
     all_jobs.extend(fetch_workday_jobs())
     all_jobs.extend(fetch_mdi_jobs())
     all_jobs.extend(fetch_dialog_jobs())
+    all_jobs.extend(fetch_alljobs_jobs())
 
     print(f"Fetched {len(all_jobs)} total jobs across all sources.")
 
