@@ -526,15 +526,16 @@ def fetch_alljobs_jobs():
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        seen_job_ids = set()
-        headings = []
-        for h in soup.find_all(["h2", "h3"]):
-            a = h.find("a", href=lambda x: x and "JobID=" in x)
-            if a:
-                jid = a["href"].split("JobID=")[-1].split("&")[0]
-                if jid not in seen_job_ids:
-                    seen_job_ids.add(jid)
-                    headings.append((h, a, jid))
+        seen_job_ids = {}
+        for a in soup.find_all("a", href=lambda x: x and "JobID=" in x):
+            jid = a["href"].split("JobID=")[-1].split("&")[0]
+            text = a.get_text(strip=True)
+            # Multiple links can point to the same job (title, "read more",
+            # etc). Keep the one with the longest text - that's the real title.
+            if jid not in seen_job_ids or len(text) > len(seen_job_ids[jid][1]):
+                seen_job_ids[jid] = (a, text)
+
+        headings = [(a, a, jid) for jid, (a, text) in seen_job_ids.items() if len(text) > 5]
 
         print(f"AllJobs: HTTP {resp.status_code}, page length {len(resp.text)} chars, "
               f"{len(headings)} job headings found")
@@ -563,8 +564,10 @@ def fetch_alljobs_jobs():
 
             steps = 0
             for elem in h.find_all_next():
-                if elem.name in ("h2", "h3"):
-                    break
+                if elem.name == "a" and elem.get("href") and "JobID=" in elem["href"]:
+                    other_jid = elem["href"].split("JobID=")[-1].split("&")[0]
+                    if other_jid != jid and len(elem.get_text(strip=True)) > 5:
+                        break  # reached the next job's title, stop here
                 text = elem.get_text(strip=True)
                 if not location and "מיקום המשרה" in text:
                     loc_links = elem.find_all("a")
@@ -576,7 +579,7 @@ def fetch_alljobs_jobs():
                 if not snippet and elem.name == "p" and len(text) > 20:
                     snippet = text
                 steps += 1
-                if steps > 40:
+                if steps > 60:
                     break
 
             if hours_ago is None:
