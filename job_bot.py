@@ -40,9 +40,11 @@ JOOBLE_API_KEY = os.environ.get("JOOBLE_API_KEY")
 MAX_AGE_HOURS = 40
 
 # Jooble searches to run. Add/adjust as needed.
+# Note: a generic "location": "Remote" search used to run here too, but it
+# returned many hybrid/onsite jobs mislabeled as remote - dropped in favor
+# of the Israel-focused searches plus the dedicated Israeli sources below.
 JOOBLE_SEARCHES = [
     {"keywords": "medical device", "location": "Israel"},
-    {"keywords": "medical device", "location": "Remote"},
     {"keywords": "medical devices", "location": "Israel"},
 ]
 
@@ -91,13 +93,42 @@ def in_weekend_blackout():
     return False
 
 MEDICAL_KEYWORDS = [
-    "medical device", "medical devices", "medtech", "med-tech",
-    "biomedical", "regulatory affairs", "clinical affairs",
-    "quality assurance", "ra/qa", "qa/ra", "diagnostics",
-    "implant", "surgical", "in vitro diagnostic", "ivd",
+    "medical device", "medical devices", "medtech", "med-tech", "med tech",
+    "biomedical", "bio-medical", "regulatory affairs", "clinical affairs",
+    "clinical research", "quality assurance", "quality engineer",
+    "ra/qa", "qa/ra", "diagnostics", "in vitro diagnostic", "ivd",
+    "implant", "implantable", "surgical device", "surgical robot",
+    "class ii", "class iii", "510(k)", "iso 13485", "cE mark", "fda submission",
+    "biocompatibility", "sterilization validation", "verification and validation",
+    "מכשור רפואי", "התקנים רפואיים", "ציוד רפואי", "רגולציה רפואית",
+    "הבטחת איכות", "מהנדס/ת איכות", "מהנדס איכות", "מהנדסת איכות",
+]
+
+# Titles that show up in medical-device-tagged categories but usually aren't
+# the kind of role this group cares about (generic corporate functions).
+# Only excludes a job if NONE of the positive keywords above also match -
+# so e.g. "Regulatory Affairs Sales Specialist" still gets through.
+EXCLUDE_KEYWORDS = [
+    "sales representative", "account executive", "office manager",
+    "administrative assistant", "executive assistant", "receptionist",
+    "bookkeeper", "accountant", "legal counsel", "general counsel",
+    "human resources coordinator", "hr coordinator", "hr specialist",
+    "מזכיר", "מזכירה", "מנהל/ת משרד", "מנהל משרד", "הנהלת חשבונות",
+    "נציג/ת מכירות", "נציג מכירות", "עוזר/ת אישי", "עוזר אישי",
+    "משאבי אנוש", "רכז/ת משאבי אנוש",
 ]
 
 REQUEST_TIMEOUT = 20
+
+
+def is_falsely_labeled_remote(job):
+    """Catches jobs whose text claims 'remote' but also mentions 'hybrid' -
+    a common mislabeling pattern that was letting non-fully-remote jobs
+    through under the remote label."""
+    haystack = f"{job.get('title', '')} {job.get('location', '')} {job.get('snippet', '')}".lower()
+    claims_remote = "remote" in haystack or "מרחוק" in haystack
+    is_actually_hybrid = "hybrid" in haystack or "היברידי" in haystack
+    return claims_remote and is_actually_hybrid
 
 
 # ---------------------------------------------------------------------------
@@ -649,10 +680,19 @@ def is_recent(job):
 
 
 def matches_medical_device(job):
-    if job.get("source") in ("MDI", "Workday", "Dialog", "AllJobs"):
-        return True  # sourced from dedicated medical device boards/companies already
     haystack = f"{job.get('title', '')} {job.get('snippet', '')}".lower()
-    return any(kw in haystack for kw in MEDICAL_KEYWORDS)
+    has_positive = any(kw in haystack for kw in MEDICAL_KEYWORDS)
+    has_exclude = any(kw in haystack for kw in EXCLUDE_KEYWORDS)
+
+    if has_exclude and not has_positive:
+        return False  # clearly generic role (sales/admin/legal/etc), reject
+
+    if job.get("source") in ("MDI", "Dialog"):
+        return True  # dedicated medical device boards - trust their own categorization
+
+    # Workday, AllJobs, and Jooble are broader/general sources - require an
+    # actual positive keyword match rather than trusting category alone.
+    return has_positive
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +781,8 @@ def main():
         if not job.get("link") or not job.get("title"):
             continue
         if not matches_medical_device(job):
+            continue
+        if is_falsely_labeled_remote(job):
             continue
         if not is_recent(job):
             continue
