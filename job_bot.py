@@ -776,19 +776,27 @@ def main():
 
     new_count = 0
     sent_count = 0
+    skipped_relevance = 0
+    skipped_remote_mismatch = 0
+    skipped_stale = 0
+    skipped_dedup = 0
 
     for job in all_jobs:
         if not job.get("link") or not job.get("title"):
             continue
         if not matches_medical_device(job):
+            skipped_relevance += 1
             continue
         if is_falsely_labeled_remote(job):
+            skipped_remote_mismatch += 1
             continue
         if not is_recent(job):
+            skipped_stale += 1
             continue
 
         h = job_hash(job["link"], job["title"], job["company"])
         if h in state:
+            skipped_dedup += 1
             continue
 
         new_count += 1
@@ -799,6 +807,9 @@ def main():
 
     save_state(state, original_raw)
     print(f"New matching jobs found: {new_count}. Successfully posted: {sent_count}.")
+    print(f"Breakdown of rejected jobs: relevance={skipped_relevance}, "
+          f"remote_mismatch={skipped_remote_mismatch}, stale={skipped_stale}, "
+          f"already_posted={skipped_dedup}")
 
 
 if __name__ == "__main__":
