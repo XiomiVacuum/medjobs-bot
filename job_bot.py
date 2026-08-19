@@ -74,6 +74,7 @@ STATE_RETENTION_DAYS = 14  # prune dedup records older than this
 MDI_JOBS_URL = "https://medical-device.co.il/jobs/"
 DIALOG_JOBS_URL = "https://www.dialog.co.il/high-tech/industries/medical"
 ALLJOBS_URL = "https://www.alljobs.co.il/SearchResultsGuest.aspx?page=1&position=939&type=&city=&region="
+NISHA_URL = "https://www.nisha.co.il/job_cat/biotech/"
 
 # No new postings during the weekend: Friday 13:00 through Saturday 21:00,
 # Israel local time (handles daylight saving automatically).
@@ -638,6 +639,91 @@ def fetch_alljobs_jobs():
 
 
 # ---------------------------------------------------------------------------
+# Source: Nisha (Israeli high-tech/biotech recruitment agency)
+# ---------------------------------------------------------------------------
+
+def fetch_nisha_jobs():
+    """
+    Parses Nisha's biotech category page (a boutique Israeli recruitment
+    agency). This category is broader than pure medical device (also
+    pharma, chemistry, food-tech, etc.), so unlike MDI/Dialog these listings
+    go through the normal keyword relevance filter rather than being
+    trusted outright. Nisha shows an explicit DD/MM/YYYY posting date,
+    giving real recency filtering (unlike MDI/Dialog's badge/ordering-only
+    approach).
+    """
+    import re
+    results = []
+    try:
+        resp = requests.get(NISHA_URL, timeout=REQUEST_TIMEOUT,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+
+        if len(resp.text) < 5000:
+            print(f"Nisha: first attempt looked like a placeholder "
+                  f"({len(resp.text)} chars) - retrying")
+            time.sleep(3)
+            resp = requests.get(NISHA_URL, timeout=REQUEST_TIMEOUT,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        headings = [h for h in soup.find_all(["h2", "h3"])
+                    if h.find("a", href=lambda x: x and "/job/" in x)]
+        print(f"Nisha: HTTP {resp.status_code}, page length {len(resp.text)} chars, "
+              f"{len(headings)} job headings found")
+
+        date_pattern = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")
+
+        for h in headings:
+            a = h.find("a", href=lambda x: x and "/job/" in x)
+            title = a.get_text(strip=True)
+            link = a["href"].strip()
+            if not title or not link:
+                continue
+
+            posted_date = None
+            company_desc = ""
+            steps = 0
+            for elem in h.find_all_next():
+                if elem.name in ("h2", "h3"):
+                    break
+                text = elem.get_text(strip=True)
+                if posted_date is None:
+                    m = date_pattern.search(text)
+                    if m and len(text) < 20:  # a standalone date line, not buried in a paragraph
+                        day, month, year = m.groups()
+                        try:
+                            posted_date = datetime(int(year), int(month), int(day), tzinfo=timezone.utc)
+                        except ValueError:
+                            pass
+                if not company_desc and elem.name == "p" and len(text) > 20:
+                    company_desc = text
+                steps += 1
+                if steps > 60:
+                    break
+
+            results.append({
+                "title": title,
+                "company": "Nisha listing",
+                "location": "Israel",
+                "snippet": company_desc[:220],
+                "link": link,
+                "updated": posted_date.isoformat() if posted_date else "",
+                "source": "Nisha",
+            })
+
+        print(f"Nisha: {len(results)} listings parsed from page 1")
+    except requests.RequestException as e:
+        print(f"ERROR fetching Nisha jobs page: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR parsing Nisha jobs page: {e}", file=sys.stderr)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Filtering
 # ---------------------------------------------------------------------------
 
@@ -771,6 +857,7 @@ def main():
     all_jobs.extend(fetch_mdi_jobs())
     all_jobs.extend(fetch_dialog_jobs())
     all_jobs.extend(fetch_alljobs_jobs())
+    all_jobs.extend(fetch_nisha_jobs())
 
     print(f"Fetched {len(all_jobs)} total jobs across all sources.")
 
